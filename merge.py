@@ -15,6 +15,7 @@ from tqdm import tqdm  # 引入 tqdm 的同步支持
 TZ_UTC_PLUS_8 = timezone(timedelta(hours=8))
 CC_T2S = OpenCC("t2s")
 TIME_FORMAT = "%Y%m%d%H%M%S%z"
+TIME_FORMAT_NO_TZ = "%Y%m%d%H%M%S"
 OUTPUT_TIME_FORMAT = "%Y%m%d%H%M%S %z"
 
 
@@ -45,6 +46,25 @@ async def fetch_epg(url):
         print(f"{url}其他错误: {e}")
     return None
 
+
+
+
+def parse_xmltv_datetime(raw_time):
+    cleaned_time = re.sub(r'\s+', '', raw_time or '')
+    if not cleaned_time:
+        raise ValueError('empty time string')
+
+    normalized_time = cleaned_time
+    if normalized_time.endswith('Z'):
+        normalized_time = normalized_time[:-1] + '+0000'
+
+    try:
+        dt = datetime.strptime(normalized_time, TIME_FORMAT)
+    except ValueError:
+        dt = datetime.strptime(normalized_time, TIME_FORMAT_NO_TZ)
+        dt = dt.replace(tzinfo=TZ_UTC_PLUS_8)
+
+    return dt.astimezone(TZ_UTC_PLUS_8)
 
 def parse_epg(epg_content):
     try:
@@ -82,6 +102,12 @@ def parse_epg(epg_content):
         if not start_raw or not stop_raw:
             continue
 
+        try:
+            channel_start = parse_xmltv_datetime(start_raw)
+            channel_stop = parse_xmltv_datetime(stop_raw)
+        except ValueError as exc:
+            print(f"Skip invalid programme time: start={start_raw}, stop={stop_raw}, error={exc}")
+            continue
         channel_start = datetime.strptime(
             re.sub(r'\s+', '', start_raw), TIME_FORMAT)
         channel_stop = datetime.strptime(
