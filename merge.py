@@ -13,12 +13,16 @@ import os
 from tqdm import tqdm  # 引入 tqdm 的同步支持
 
 TZ_UTC_PLUS_8 = timezone(timedelta(hours=8))
+CC_T2S = OpenCC("t2s")
+TIME_FORMAT = "%Y%m%d%H%M%S%z"
+TIME_FORMAT_NO_TZ = "%Y%m%d%H%M%S"
+OUTPUT_TIME_FORMAT = "%Y%m%d%H%M%S %z"
 
 
 def transform2_zh_hans(string):
-    cc = OpenCC("t2s")
-    new_str = cc.convert(string)
-    return new_str
+    if string is None:
+        return ""
+    return CC_T2S.convert(string)
 
 
 async def fetch_epg(url):
@@ -43,6 +47,25 @@ async def fetch_epg(url):
     return None
 
 
+
+
+def parse_xmltv_datetime(raw_time):
+    cleaned_time = re.sub(r'\s+', '', raw_time or '')
+    if not cleaned_time:
+        raise ValueError('empty time string')
+
+    normalized_time = cleaned_time
+    if normalized_time.endswith('Z'):
+        normalized_time = normalized_time[:-1] + '+0000'
+
+    try:
+        dt = datetime.strptime(normalized_time, TIME_FORMAT)
+    except ValueError:
+        dt = datetime.strptime(normalized_time, TIME_FORMAT_NO_TZ)
+        dt = dt.replace(tzinfo=TZ_UTC_PLUS_8)
+
+    return dt.astimezone(TZ_UTC_PLUS_8)
+
 def parse_epg(epg_content):
     try:
         parser = ET.XMLParser(encoding='UTF-8')
@@ -57,10 +80,15 @@ def parse_epg(epg_content):
 
     for channel in root.findall('channel'):
         channel_id = transform2_zh_hans(channel.get('id'))
+        if not channel_id:
+            continue
         channel_display_names = []
         for name in channel.findall('display-name'):
-            channel_display_names.append([transform2_zh_hans(name.text), name.get('lang', 'zh')])
-        if not channel_id.isdigit() and channel_id not in channel_display_names:
+            display_name = transform2_zh_hans(name.text)
+            if display_name:
+                channel_display_names.append([display_name, name.get('lang', 'zh')])
+        existing_display_names = {name[0] for name in channel_display_names}
+        if not channel_id.isdigit() and channel_id not in existing_display_names:
             channel_display_names.append([channel_id, 'zh'])
         channels[channel_id] = channel_display_names
 
@@ -69,18 +97,28 @@ def parse_epg(epg_content):
 
     for programme in root.findall('programme'):
         channel_id = transform2_zh_hans(programme.get('channel'))
-        channel_start = datetime.strptime(
-            re.sub(r'\s+', '', programme.get('start')), "%Y%m%d%H%M%S%z")
-        channel_stop = datetime.strptime(
-            re.sub(r'\s+', '', programme.get('stop')), "%Y%m%d%H%M%S%z")
-        channel_start = channel_start.astimezone(TZ_UTC_PLUS_8)
-        channel_stop = channel_stop.astimezone(TZ_UTC_PLUS_8)
+        start_raw = programme.get('start')
+        stop_raw = programme.get('stop')
+        if not start_raw or not stop_raw:
+            continue
+
+        try:
+            channel_start = parse_xmltv_datetime(start_raw)
+            channel_stop = parse_xmltv_datetime(stop_raw)
+        except ValueError as exc:
+            print(f"Skip invalid programme time: start={start_raw}, stop={stop_raw}, error={exc}")
+            continue
 
         if channel_stop.date() == today:
             valid_channels.add(channel_id)
 
-        channel_elem = ET.SubElement(
-            root, 'programme', attrib={"channel": channel_id, "start": channel_start.strftime("%Y%m%d%H%M%S %z"), "stop": channel_stop.strftime("%Y%m%d%H%M%S %z")})
+        channel_elem = ET.Element(
+            'programme', attrib={
+                "channel": channel_id,
+                "start": channel_start.strftime(OUTPUT_TIME_FORMAT),
+                "stop": channel_stop.strftime(OUTPUT_TIME_FORMAT),
+            }
+        )
         for title in programme.findall('title'):
             if title.text is None:
                 channel_title = "精彩节目"
@@ -89,8 +127,7 @@ def parse_epg(epg_content):
             langattr = title.get('lang')
             if langattr == 'zh' or langattr is None:
                 channel_title = transform2_zh_hans(channel_title)
-            channel_elem_t = ET.SubElement(
-                channel_elem, 'title')
+            channel_elem_t = ET.SubElement(channel_elem, 'title')
             channel_elem_t.text = channel_title
             if langattr is not None:
                 channel_elem_t.set('lang', langattr)
@@ -101,8 +138,7 @@ def parse_epg(epg_content):
             channel_desc = desc.text.strip()
             if langattr == 'zh' or langattr is None:
                 channel_desc = transform2_zh_hans(channel_desc)
-            channel_elem_d = ET.SubElement(
-                channel_elem, 'desc')
+            channel_elem_d = ET.SubElement(channel_elem, 'desc')
             channel_elem_d.text = channel_desc.strip()
             if langattr is not None:
                 channel_elem_d.set('lang', langattr)
@@ -122,7 +158,7 @@ def write_to_xml(channels_id, channels_names, programmes, filename):
     # 目录不存在
     if not os.path.exists('output'):
         os.makedirs('output')
-    current_time = datetime.now(TZ_UTC_PLUS_8).strftime("%Y%m%d%H%M%S %z")
+    current_time = datetime.now(TZ_UTC_PLUS_8).strftime(OUTPUT_TIME_FORMAT)
     root = ET.Element('tv', attrib={'date': current_time})
     for channel_id in channels_id:
         channel_elem = ET.SubElement(
@@ -183,19 +219,20 @@ async def main():
             for channel_id, display_names in channels.items():
                 if len(programmes[channel_id]) == 0:
                     continue
-                is_in_map = channel_id in all_channels_map
-                map_id = channel_id
+                map_id = all_channels_map.get(channel_id, channel_id)
+                is_in_map = map_id != channel_id
                 for display_name_node in display_names:
                     display_name = display_name_node[0]
                     if is_in_map:
                         break
-                    is_in_map = is_in_map or (display_name  in all_channels_map)
-                    map_id = display_name
-                map_id = all_channels_map.get(map_id, channel_id)
+                    existing_map_id = all_channels_map.get(display_name)
+                    if existing_map_id:
+                        map_id = existing_map_id
+                        is_in_map = True
                 if not is_in_map:
                     all_channel_id.add(channel_id)
                     all_channel_names[channel_id] = display_names
-                    all_programmes[display_name] = programmes[channel_id]
+                    all_programmes[channel_id] = programmes[channel_id]
                     all_channels_map[channel_id] = channel_id
                     for display_name_node in display_names:
                         display_name = display_name_node[0]
