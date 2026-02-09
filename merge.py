@@ -108,6 +108,12 @@ def parse_epg(epg_content):
         except ValueError as exc:
             print(f"Skip invalid programme time: start={start_raw}, stop={stop_raw}, error={exc}")
             continue
+        channel_start = datetime.strptime(
+            re.sub(r'\s+', '', start_raw), TIME_FORMAT)
+        channel_stop = datetime.strptime(
+            re.sub(r'\s+', '', stop_raw), TIME_FORMAT)
+        channel_start = channel_start.astimezone(TZ_UTC_PLUS_8)
+        channel_stop = channel_stop.astimezone(TZ_UTC_PLUS_8)
 
         if channel_stop.date() == today:
             valid_channels.add(channel_id)
